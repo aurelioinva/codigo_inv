@@ -1,0 +1,197 @@
+# ===========================================================
+# RANKEAR QUAL R PRIORIZAR (COMPLETO E ROBUSTO)
+# - Calcula F1 OvR por classe com GroupKFold (blocos por H3)
+# - Cruza com suporte por classe
+# - Recomenda o R de início segundo 3 critérios:
+#     impacto  -> muito suporte + F1 baixo (maior ganho potencial)
+#     fraqueza -> onde o modelo vai pior, com suporte mínimo
+#     rapido   -> classe com maior suporte (vitória rápida)
+# - Autocontém pipeline caso 'pipe' não exista
+# ===========================================================
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+
+# -------------------------
+# 0) Validar insumos mínimos
+# -------------------------
+assert 'occ' in globals(), "A base 'occ' precisa estar carregada (ocorrencias_structured com merges)."
+
+COL_ALVO = 'categoria_macro' if 'COL_ALVO' not in globals() else COL_ALVO
+assert COL_ALVO in occ.columns, f"Coluna alvo '{COL_ALVO}' não encontrada em occ."
+
+# Grupos (H3 parent já calculado no seu pipeline; fallback: usa h3_8)
+if 'h3_group' in occ.columns:
+    grupos_array = occ['h3_group'].astype(str).values
+elif 'h3_8' in occ.columns:
+    grupos_array = occ['h3_8'].astype(str).values
+else:
+    # fallback sem bloqueio espacial (desencorajado, mas evita travar)
+    print("⚠️  Nenhuma coluna de grupo (h3_group/h3_8) encontrada. Usando KFold simples por posição.")
+    grupos_array = np.arange(len(occ))
+
+# Limpar alvo e manter apenas classes R0..R5
+occ[COL_ALVO] = occ[COL_ALVO].astype(str).str.strip().str.upper()
+occ = occ[occ[COL_ALVO].isin(["R0","R1","R2","R3","R4","R5"])].copy()
+
+# ---------------------------------------------------
+# 1) Seleção (ou inferência) de variáveis de entrada
+# ---------------------------------------------------
+# Se num_cands / cat_cands não existirem, inferir dos nomes mais prováveis:
+if 'num_cands' not in globals():
+    provaveis_num = [
+        "length_km_h3","vmd_rep","vmdtot",
+        "shorizonta_sinuosidade","svertical_sinuosidade","sinuosidade_idx",
+        "smod_event_year","hora","ano","mes"
+    ]
+    num_cands = [c for c in provaveis_num if c in occ.columns]
+    # fallback: pegar numéricas do dataframe (exclui alvo)
+    if not num_cands:
+        num_cands = occ.select_dtypes(include=[np.number]).columns.tolist()
+        num_cands = [c for c in num_cands if c != COL_ALVO]
+
+if 'cat_cands' not in globals():
+    provaveis_cat = [
+        "faixa_hora","pav_status","classfunc","resp","rmbh","rodovia","tipo_logradouro_descricao"
+    ]
+    cat_cands = [c for c in provaveis_cat if c in occ.columns]
+    # fallback: pegar objetos (exclui alvo)
+    if not cat_cands:
+        cat_cands = occ.select_dtypes(include=['object']).columns.tolist()
+        cat_cands = [c for c in cat_cands if c != COL_ALVO]
+
+# Coerção de tipos
+occ[num_cands] = occ[num_cands].apply(pd.to_numeric, errors="coerce")
+for c in cat_cands:
+    occ[c] = occ[c].astype(str).str.strip().replace({"NAN": np.nan, "NONE": np.nan})
+
+# ---------------------------------------------
+# 2) Criar pipeline padrão (se não existir pipe)
+# ---------------------------------------------
+if 'pipe' not in globals():
+    # Encoder compatível com versões antigas/novas do sklearn
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+    num_imputer = SimpleImputer(strategy="mean")
+    cat_imputer = SimpleImputer(strategy="constant", fill_value="missing")
+
+    preprocess = ColumnTransformer([
+        ("num", Pipeline([("imputer", num_imputer), ("scaler", StandardScaler(with_mean=False))]), num_cands),
+        ("cat", Pipeline([("imputer", cat_imputer), ("onehot", encoder)]), cat_cands)
+    ])
+
+    clf = LogisticRegression(
+        multi_class="multinomial",
+        solver="lbfgs",
+        max_iter=500,
+        class_weight="balanced"
+    )
+
+    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
+
+# -------------------------------------------
+# 3) Funções: F1 por classe e recomendações
+# -------------------------------------------
+def per_class_f1_groupcv(df, alvo, grupos, num_cols, cat_cols, pipeline, n_splits=5):
+    """Retorna Série com F1 OvR médio por classe (GroupKFold)."""
+    X = df[num_cols + cat_cols].copy()
+    y = df[alvo].astype(str).values
+    classes = sorted(pd.unique(y))
+
+    f1_somas = {c: 0.0 for c in classes}
+    cont_folds = {c: 0 for c in classes}
+
+    gkf = GroupKFold(n_splits=n_splits)
+    for tr, va in gkf.split(X, y, groups=grupos):
+        pipeline.fit(X.iloc[tr], y[tr])
+        y_pred = pipeline.predict(X.iloc[va])
+        rep = classification_report(y[va], y_pred, labels=classes, output_dict=True, zero_division=0)
+        for c in classes:
+            if c in rep:
+                f1_somas[c] += rep[c].get("f1-score", 0.0)
+                cont_folds[c] += 1
+
+    f1_medios = {c: (f1_somas[c] / cont_folds[c]) if cont_folds[c] > 0 else np.nan for c in classes}
+    return pd.Series(f1_medios, name="f1_ovr_cv")
+
+def suporte_por_classe(df, col_target):
+    tab = df[col_target].value_counts().sort_index()
+    return pd.DataFrame({"contagem": tab, "proporcao": tab / tab.sum()})
+
+def recomendar_classe(metricas_df, criterio="impacto", suporte_min=0.03):
+    """Retorna (classe_escolhida, ranking_df) com coluna 'score' para todos os critérios."""
+    df = metricas_df.copy()
+
+    # Normalizações 0..1
+    f1 = df["f1_ovr_cv"].fillna(0.0)
+    f1_norm = (f1 - f1.min()) / (f1.max() - f1.min() + 1e-9)
+    sup = df["proporcao"].fillna(0.0)
+    sup_norm = (sup - sup.min()) / (sup.max() - sup.min() + 1e-9)
+
+    if criterio == "impacto":
+        # muito suporte + F1 baixo => maior ganho potencial
+        df["score"] = 0.6 * sup_norm + 0.4 * (1 - f1_norm)
+        df = df[df["proporcao"] >= suporte_min].copy()
+
+    elif criterio == "fraqueza":
+        # onde o modelo vai pior, mantendo viabilidade mínima de suporte
+        df = df[df["proporcao"] >= suporte_min].copy()
+        df["score"] = (1 - f1_norm)
+
+    elif criterio == "rapido":
+        # vitória rápida: basicamente maior suporte
+        df["score"] = sup_norm
+
+    else:
+        raise ValueError("Critério inválido. Use: 'impacto', 'fraqueza' ou 'rapido'.")
+
+    # fallback se o filtro eliminou tudo (mantém coerência)
+    if df.empty:
+        df = metricas_df.copy()
+        df["score"] = {
+            "impacto": 0.6 * sup_norm + 0.4 * (1 - f1_norm),
+            "fraqueza": (1 - f1_norm),
+            "rapido": sup_norm
+        }[criterio]
+
+    escolhido = df.sort_values("score", ascending=False).index[0]
+    return escolhido, df
+
+# --------------------------
+# 4) Execução e recomendações
+# --------------------------
+# F1 por classe
+f1_por_classe = per_class_f1_groupcv(
+    df=occ,
+    alvo=COL_ALVO,
+    grupos=grupos_array,
+    num_cols=num_cands,
+    cat_cols=cat_cands,
+    pipeline=pipe,
+    n_splits=5
+)
+
+# Suporte
+sup = suporte_por_classe(occ, COL_ALVO)
+
+# Tabela consolidada
+metricas = sup.join(f1_por_classe, how="left").sort_index()
+print("\n=== MÉTRICAS POR CLASSE (R0–R5) ===")
+print(metricas.round(3))
+
+# Recomendações (3 estratégias)
+for crit in ["impacto", "fraqueza", "rapido"]:
+    r_escolhido, df_rank = recomendar_classe(metricas, criterio=crit, suporte_min=0.03)
+    print(f"\n[Recomendação - {crit.upper()}] Começar por: {r_escolhido}")
+    cols_to_show = [c for c in ["contagem","proporcao","f1_ovr_cv","score"] if c in df_rank.columns]
+    print(df_rank[cols_to_show].sort_values("score", ascending=False).round(3))
