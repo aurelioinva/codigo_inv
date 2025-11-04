@@ -1,0 +1,180 @@
+# ===========================================================
+# BASELINE FOCADO EM R2 — LOGISTIC REGRESSION E RANDOM FOREST
+# ===========================================================
+
+!pip -q install pandas numpy scikit-learn seaborn matplotlib
+
+import os, warnings, json, shutil
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    f1_score, precision_score, recall_score, roc_auc_score,
+    confusion_matrix, roc_curve, auc
+)
+
+warnings.filterwarnings("ignore")
+plt.style.use("seaborn-v0_8-whitegrid")
+np.random.seed(42)
+
+
+smod_cols = [c for c in smod.columns if c.startswith("smod")]
+if "h3_8" in smod.columns and smod_cols:
+    smod = smod[["h3_8", smod_cols[0]]].rename(columns={smod_cols[0]: "smod_event_year"})
+
+for nome, df in [("Rodovias", rod), ("Sinuosidade", sin), ("SMOD", smod)]:
+    if "h3_8" in df.columns and "h3_8" in occ.columns:
+        occ = occ.merge(df, on="h3_8", how="left")
+        print(f"🔗 Merge com {nome}: {occ.shape[1]} colunas.")
+
+# -----------------------
+# FOCO EM R2
+# -----------------------
+occ["categoria_macro"] = occ["categoria_macro"].astype(str).str.upper().str.strip()
+occ = occ[occ["categoria_macro"].isin(["R2", "R0","R1","R3","R4","R5"])].copy()
+occ["alvo_bin"] = (occ["categoria_macro"] == "R2").astype(int)
+print(f"🔹 Total: {occ.shape[0]} registros | {occ['alvo_bin'].sum()} são R2")
+
+# -----------------------
+# FEATURES
+# -----------------------
+num_vars = [c for c in [
+    "length_km_h3","vmdtot","vmd_rep","shorizonta_sinuosidade",
+    "svertical_sinuosidade","sinuosidade_idx","hora","ano","mes"
+] if c in occ.columns]
+
+cat_vars = [c for c in [
+    "faixa_hora","pav_status","classfunc","resp","rmbh",
+    "rodovia","tipo_logradouro_descricao","smod_event_year"
+] if c in occ.columns]
+
+# -----------------------
+# PRÉ-PROCESSAMENTO
+# -----------------------
+def winsorize(s, ql=0.01, qh=0.99):
+    lo, hi = s.quantile(ql), s.quantile(qh)
+    return s.clip(lo, hi)
+
+for c in num_vars:
+    occ[c] = pd.to_numeric(occ[c], errors="coerce")
+    occ[c] = winsorize(occ[c])
+
+X = occ[num_vars + cat_vars].copy()
+y = occ["alvo_bin"].copy()
+grupos = occ["h3_group"] if "h3_group" in occ.columns else occ["h3_8"]
+
+try:
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+except TypeError:
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+num_pre = Pipeline([("imp", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler(with_mean=False))])
+cat_pre = Pipeline([("imp", SimpleImputer(strategy="constant", fill_value="missing")),
+                    ("onehot", encoder)])
+
+prep = ColumnTransformer([
+    ("num", num_pre, num_vars),
+    ("cat", cat_pre, cat_vars)
+])
+
+# -----------------------
+# MODELOS
+# -----------------------
+logreg = Pipeline([
+    ("prep", prep),
+    ("clf", LogisticRegression(max_iter=500, class_weight="balanced"))
+])
+
+rf = Pipeline([
+    ("prep", prep),
+    ("clf", RandomForestClassifier(n_estimators=150, random_state=42,
+                                   class_weight="balanced", n_jobs=-1))
+])
+
+# -----------------------
+# VALIDAÇÃO ESPACIAL
+# -----------------------
+gkf = GroupKFold(n_splits=5)
+results = []
+
+def avaliar(pipe, nome):
+    f1s, aucs, precs, recs = [], [], [], []
+    for i, (tr, va) in enumerate(gkf.split(X, y, groups=grupos), start=1):
+        pipe.fit(X.iloc[tr], y.iloc[tr])
+        prob = pipe.predict_proba(X.iloc[va])[:,1]
+        pred = (prob >= 0.5).astype(int)
+
+        f1s.append(f1_score(y.iloc[va], pred))
+        precs.append(precision_score(y.iloc[va], pred))
+        recs.append(recall_score(y.iloc[va], pred))
+        aucs.append(roc_auc_score(y.iloc[va], prob))
+
+    df = pd.DataFrame({
+        "Modelo": nome,
+        "F1_macro": np.mean(f1s),
+        "AUC": np.mean(aucs),
+        "Precisao": np.mean(precs),
+        "Recall": np.mean(recs)
+    }, index=[0])
+    print(f"\n=== {nome} ===\n", df.round(3))
+    results.append(df)
+    return pipe
+
+logreg_fit = avaliar(logreg, "LogisticRegression")
+rf_fit = avaliar(rf, "RandomForest")
+
+metricas = pd.concat(results)
+metricas.to_csv(f"{OUT_DIR}/metricas_R2.csv", index=False)
+
+# -----------------------
+# MATRIZ DE CONFUSÃO
+# -----------------------
+pred_lr = logreg_fit.predict(X)
+pred_rf = rf_fit.predict(X)
+
+cm_lr = confusion_matrix(y, pred_lr)
+cm_rf = confusion_matrix(y, pred_rf)
+
+def plot_cm(cm, nome):
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["Não R2","R2"], yticklabels=["Não R2","R2"])
+    plt.title(f"Matriz de Confusão — {nome}")
+    plt.xlabel("Predito"); plt.ylabel("Verdadeiro")
+    plt.tight_layout()
+    plt.savefig(f"{OUT_DIR}/confusao_{nome}.png")
+    plt.close()
+
+plot_cm(cm_lr, "LogisticRegression")
+plot_cm(cm_rf, "RandomForest")
+
+# -----------------------
+# CURVA ROC
+# -----------------------
+def plot_roc(modelo, nome):
+    prob = modelo.predict_proba(X)[:,1]
+    fpr, tpr, _ = roc_curve(y, prob)
+    roc_auc = auc(fpr, tpr)
+    plt.figure(figsize=(5,4))
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f"AUC = {roc_auc:.2f}")
+    plt.plot([0,1],[0,1],'--',color='gray')
+    plt.xlabel('1 - Especificidade')
+    plt.ylabel('Sensibilidade')
+    plt.title(f"Curva ROC — {nome}")
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(f"{OUT_DIR}/roc_{nome}.png")
+    plt.close()
+
+plot_roc(logreg_fit, "LogisticRegression")
+plot_roc(rf_fit, "RandomForest")
